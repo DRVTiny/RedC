@@ -18,11 +18,11 @@ use Ref::Util qw(is_hashref is_plain_coderef is_plain_hashref is_plain_arrayref)
 use Scalar::Util qw(refaddr);
 
 use Exporter qw(import);
-our @EXPORT_OK=qw(get_redc_by);
+our @EXPORT_OK = qw(get_redc_by);
 
 my (%conoByName, %conoByRef);
 # By default, after connection failure try to reconnect every 100 ms up to 10 seconds
-my $redTestObj = Redis::Fast->new('reconnect'=>RECONNECT_UP_TO, 'every'=>RECONNECT_EVERY);
+my $redTestObj = Redis::Fast->new( 'reconnect' => RECONNECT_UP_TO, 'every' => RECONNECT_EVERY);
 sub new {
     state $exclOptions={'on_connect'=>1, 'encoder'=>1};
     my ($class, %options)=@_;
@@ -57,7 +57,12 @@ sub new {
         },
         (map {$_=>$options{$_}} grep { !$exclOptions->{$_} } keys %options),
     );
-    $conoByRef{refaddr $redC} = $conoByName{$coName} = {'name'=>$coName, 'index'=>$conIndex, 'redc'=>\$redC};
+    $conoByRef{refaddr $redC} = $conoByName{$coName} = {
+        'name'	=>	$coName,
+        'index'	=>	$conIndex,
+        'redc'	=>	\$redC,
+        $options{'encoder'} ? ('encoder_tag'=>$options{'encoder'}) : ()
+    };
     return $redC;
 }
 
@@ -69,22 +74,57 @@ sub select {
     confess 'Redis method "select" is prohibited for '.__PACKAGE__.' objects'
 }
 
-sub write {
+my %writeMethodsDiff = (
+    'fast' => {
+        'method_suffix' => '',
+        'check_for_null' => '$v //= "";'
+    },
+    'safe' => {
+        'method_suffix' => '_not_null',
+        'check_for_null' => 'defined($v) or confess qq(Value for <<$k>> key is NULL);'
+    },
+);
+
+my $writeMethodTmpl = <<'EOMETHOD';
+sub write<<METHOD_SUFFIX>> {
+    state $errEmptyList = 'Cant write empty list anywhere';
     my $redC = shift;
-    
+    @_ or confess $errEmptyList;
     my $cb = pop(@_) if is_plain_coderef($_[$#_]);
     return unless @_;
-    my $method = (@_>2 ? 'm' : '') . 'set';
     my $encTag = $redC->encoder;
-    $redC->$method(
-        ( map {
-            my ($k, $v) = (shift, shift);
-            $k => ref($v)
-                ? encodeByTag($encTag => $v)
-                : do { utf8::encode($v) if utf8::is_utf8($v); $v }
-        } 1..+(scalar(@_)>>1) ),
-        $cb ? ($cb) : ()
-    );
+    if ( is_plain_hashref($_[0]) ) {
+        %{$_[0]} or confess $errEmptyList; # there is nothing to write
+        my $data = $_[0];
+        my $method = (keys($data) > 1 ? 'm' : '') . 'set';
+        $redC->$method(
+            ( map {
+                my ($k, $v) = each $data;
+                <<CHECK_FOR_NULL>>
+                $k => ref($v)
+                    ? encodeByTag($encTag => $v)
+                    : do { utf8::is_utf8($v) and utf8::encode($v); $v }
+            } 1..keys($data) ),
+            $cb ? ($cb) : ()
+        )
+    } else {
+        my $method = (@_ > 2 ? 'm' : '') . 'set';
+        $redC->$method(
+            ( map {
+                my ($k, $v) = (shift, shift);
+                <<CHECK_FOR_NULL>>
+                $k => ref($v)
+                    ? encodeByTag($encTag => $v)
+                    : do { utf8::is_utf8($v) and utf8::encode($v); $v }
+            } 1..+(scalar(@_) >> 1) ),
+            $cb ? ($cb) : ()
+        )
+    }
+}
+EOMETHOD
+
+for my $patch ( values %writeMethodsDiff ) {
+    eval $writeMethodTmpl =~ s%<<([A-Z][A-Z_]+[A-Z](?:[0-9]{1,3})?)>>%$patch->{lc $1} // ''%ger;
 }
 
 sub read {
@@ -108,8 +148,8 @@ sub read {
         $retv=
             $flRetHashRef
             ? do {
-                my $c=0;
-                scalar({ map { $k->[$c++] => decodeByTag($_) } is_plain_arrayref($_[0]) ? @{$_[0]} : ($_[0]) })
+                my $c = 0;
+                scalar({ map { defined($_) ? ($k->[$c++] => decodeByTag($_)) : do { warn $k->[$c] . " is NULL, k=[@{$k}]!"; ($k->[$c] => undef) } } is_plain_arrayref($_[0]) ? @{$_[0]} : ($_[0]) })
               }
             : [ map decodeByTag($_), is_plain_arrayref($_[0]) ? @{$_[0]} : ($_[0]) ];
         $cb->( $retv ) if $cb;
