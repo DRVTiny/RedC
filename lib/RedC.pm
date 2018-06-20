@@ -12,16 +12,145 @@ use parent 'Redis::Fast';
 use utf8;
 binmode $_=>':utf8' for *STDOUT,*STDERR;
 use 5.16.1;
-
+use Data::Dumper;
 use Tag::DeCoder;
 use Carp		qw(confess);
 use Ref::Util 		qw(is_hashref is_plain_coderef is_plain_hashref is_plain_arrayref);
 use Scalar::Util 	qw(refaddr);
-
 use Exporter qw(import);
 our @EXPORT_OK = qw(get_redc_by);
 
 my (%conoByName, %conoByRef);
+
+sub dump_cono_by {
+    say Dumper +{
+        'by_name' => \%conoByName,
+        'by_ref'  => \%conoByRef,
+    }
+}
+BEGIN {
+    my %methodsGen = (
+        'write' => {
+            'variants' => {
+                'fast' => {
+                    'check_for_null' => '$v //= "";'
+                },
+                'safe' => {
+                    'suffix' => '_not_null',
+                    'check_for_null' => 'defined($v) or confess qq(illegal attempt to write undef value for <<$k>> key);'
+                },
+            }
+        },
+        'read' => {
+            'variants' => {
+                'null_is_undef' => {
+                    'if_null_hsh' => '($key => undef)',
+                    'if_null_arr' => 'undef',
+                },
+                'null_is_prohibited' => {
+                    'suffix' => '_not_null',
+                    'if_null_hsh' => 'confess sprintf(q{illegal attempt to read value of unexisting key <<%s>> in redis_db #%d named here as <<%s>>}, $key, $redC->index, $redC->name)',
+                    'if_null_arr' => 'confess sprintf(q{illegal attempt to read value of unexisting key <<%s>> in redis_db #%d named here as <<%s>>}, $key, $redC->index, $redC->name)',
+                },
+            }
+        },
+    );
+    
+    $methodsGen{'write'}{'template'} = <<'EOMETHOD';
+        state $errEmptyList = 'Cant write empty list anywhere';
+        my $redC = shift;
+        @_ or confess $errEmptyList;
+        my $cb = pop(@_) if is_plain_coderef($_[$#_]);
+        return unless @_;
+        my $encTag = $redC->encoder;
+        if ( is_plain_hashref($_[0]) ) {
+            %{$_[0]} or confess $errEmptyList; # there is nothing to write
+            my $data = $_[0];
+            my $method = (keys($data) > 1 ? 'm' : '') . 'set';
+            $redC->$method(
+                ( map {
+                    my ($k, $v) = each $data;
+                    <<CHECK_FOR_NULL>>
+                    $k => ref($v)
+                        ? encodeByTag($encTag => $v)
+                        : do { utf8::is_utf8($v) and utf8::encode($v); $v }
+                } 1..keys($data) ),
+                $cb ? ($cb) : ()
+            )
+        } else {
+            my $method = (@_ > 2 ? 'm' : '') . 'set';
+            $redC->$method(
+                ( map {
+                    my ($k, $v) = (shift, shift);
+                    <<CHECK_FOR_NULL>>
+                    $k => ref($v)
+                        ? encodeByTag($encTag => $v)
+                        : do { utf8::is_utf8($v) and utf8::encode($v); $v }
+                } 1..+(scalar(@_) >> 1) ),
+                $cb ? ($cb) : ()
+            )
+        }
+EOMETHOD
+
+    $methodsGen{'read'}{'template'} = <<'EOMETHOD';
+        my $redC = shift;
+        my $opts = is_plain_hashref($_[0]) ? do { $_=shift; %{$_}? $_ : {'ret_hash_ref'=>1} } : undef;
+        my $cb = pop(@_) if is_plain_coderef($_[$#_]);
+        return unless @_;
+        my $flRetHashRef = $opts->{'ret_hash_ref'};
+        my $k = [ map { is_plain_arrayref($_) ? @{$_} : $_ } @_ ];
+        my $method = ($#{$k} ? 'm' : '') . 'get';
+        my $retv;
+        $redC->$method( @{$k} => 
+        sub {
+            if ( defined $_[1] ) {
+                if ( $cb ) {
+                    $cb->(@_)
+                } else {
+                    confess 'Redis error: '.$_[1]
+                }
+            }
+            $retv = 
+                $flRetHashRef
+                ? do {
+                    my $c = 0;
+                    +{ 
+                        map {
+                            my $key = $k->[$c++];
+                            defined($_)
+                                ? ($key => decodeByTag($_))
+                                : <<IF_NULL_HSH>>
+                        } is_plain_arrayref($_[0]) ? @{$_[0]} : ($_[0])
+                    }
+                  }
+                : do {
+                    my $c = 0;
+                    [ 
+                        map { 
+                            my $key = $k->[$c++];
+                            defined($_)
+                                ? decodeByTag($_)
+                                : <<IF_NULL_ARR>>
+                        } is_plain_arrayref($_[0]) ? @{$_[0]} : ($_[0]) 
+                    ]
+                  };
+            $cb->( $retv ) if $cb;
+        });
+        return 1 if $cb;
+        $redC->wait_all_responses;
+        return $retv;
+EOMETHOD
+    
+    while (my ($methodCmnName, $methodGen) = each %methodsGen) {
+        no strict 'refs';
+        my $methodTmplCode = sprintf("sub {\n%s\n}", $methodGen->{'template'});
+        for my $methodCodePatch ( values $methodGen->{'variants'} ) {
+            my $methodGenName = $methodCmnName . ($methodCodePatch->{'suffix'} // '');
+            *{__PACKAGE__ . '::' . $methodGenName} = eval($methodTmplCode =~ s%<<([A-Z][A-Z_]+[A-Z](?:[0-9]{1,3})?)>>%$methodCodePatch->{lc $1} // ''%ger) // die $@;
+        }
+    }
+
+}
 # By default, after connection failure try to reconnect every 100 ms up to 10 seconds
 my $redTestObj = Redis::Fast->new( 'reconnect' => RECONNECT_UP_TO, 'every' => RECONNECT_EVERY);
 sub new {
@@ -31,7 +160,7 @@ sub new {
     my ($coName, $conIndex) = delete @options{qw/name index/};
     $conIndex = DFLT_REDIS_DB_N unless defined $conIndex and $conIndex !~ /[^\d]/;
     $coName //= join('_' => 'redc', 'anon', 'pid'.$$, int(rand 65536));
-    $conoByName{$coName} and confess sprintf(q<Cant initialize RedC: name '%s' was already reserved as a Redis connector name>, $coName);
+    exists($conoByName{$coName}) and confess sprintf(q<Cant initialize RedC: name '%s' was already reserved as a Redis connector name>, $coName);
     
     if ( $conIndex ) {
         my $nDB = databases( $redTestObj );
@@ -83,90 +212,7 @@ sub index {
     defined($_[1]) ? $_[0]->select($_[1]) : $conoByRef{refaddr $_[0]}{'index'}
 }
 
-my %writeMethodsDiff = (
-    'fast' => {
-        'method_suffix' => '',
-        'check_for_null' => '$v //= "";'
-    },
-    'safe' => {
-        'method_suffix' => '_not_null',
-        'check_for_null' => 'defined($v) or confess qq(Value for <<$k>> key is NULL);'
-    },
-);
-
-my $writeMethodTmpl = <<'EOMETHOD';
-sub write<<METHOD_SUFFIX>> {
-    state $errEmptyList = 'Cant write empty list anywhere';
-    my $redC = shift;
-    @_ or confess $errEmptyList;
-    my $cb = pop(@_) if is_plain_coderef($_[$#_]);
-    return unless @_;
-    my $encTag = $redC->encoder;
-    if ( is_plain_hashref($_[0]) ) {
-        %{$_[0]} or confess $errEmptyList; # there is nothing to write
-        my $data = $_[0];
-        my $method = (keys($data) > 1 ? 'm' : '') . 'set';
-        $redC->$method(
-            ( map {
-                my ($k, $v) = each $data;
-                <<CHECK_FOR_NULL>>
-                $k => ref($v)
-                    ? encodeByTag($encTag => $v)
-                    : do { utf8::is_utf8($v) and utf8::encode($v); $v }
-            } 1..keys($data) ),
-            $cb ? ($cb) : ()
-        )
-    } else {
-        my $method = (@_ > 2 ? 'm' : '') . 'set';
-        $redC->$method(
-            ( map {
-                my ($k, $v) = (shift, shift);
-                <<CHECK_FOR_NULL>>
-                $k => ref($v)
-                    ? encodeByTag($encTag => $v)
-                    : do { utf8::is_utf8($v) and utf8::encode($v); $v }
-            } 1..+(scalar(@_) >> 1) ),
-            $cb ? ($cb) : ()
-        )
-    }
-}
-EOMETHOD
-
-for my $patch ( values %writeMethodsDiff ) {
-    eval $writeMethodTmpl =~ s%<<([A-Z][A-Z_]+[A-Z](?:[0-9]{1,3})?)>>%$patch->{lc $1} // ''%ger;
-}
-
-sub read {
-    my $redC = shift;
-    my $opts = is_plain_hashref($_[0]) ? do { $_=shift; %{$_}? $_ : {'ret_hash_ref'=>1} } : undef;
-    my $cb = pop(@_) if is_plain_coderef($_[$#_]);
-    return unless @_;
-    my $flRetHashRef = $opts->{'ret_hash_ref'};
-    my $k = [ map { is_plain_arrayref($_) ? @{$_} : $_ } @_ ];
-    my $method = ($#{$k} ? 'm' : '') . 'get';
-    my $retv;
-    $redC->$method( @{$k} => 
-    sub {
-        if ( defined $_[1] ) {
-            if ( $cb ) {
-                $cb->(@_)
-            } else {
-                confess 'Redis error: '.$_[1]
-            }
-        }
-        $retv=
-            $flRetHashRef
-            ? do {
-                my $c = 0;
-                scalar({ map { defined($_) ? ($k->[$c++] => decodeByTag($_)) : do { warn $k->[$c] . " is NULL, k=[@{$k}]!"; ($k->[$c] => undef) } } is_plain_arrayref($_[0]) ? @{$_[0]} : ($_[0]) })
-              }
-            : [ map decodeByTag($_), is_plain_arrayref($_[0]) ? @{$_[0]} : ($_[0]) ];
-        $cb->( $retv ) if $cb;
-    });
-    return 1 if $cb;
-    $redC->wait_all_responses;
-    return $retv;
-}
+sub name { $conoByRef{refaddr $_[0]}{'name'} } 
 
 sub databases {
     my $redC = shift;
