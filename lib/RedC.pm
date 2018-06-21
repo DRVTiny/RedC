@@ -5,6 +5,8 @@ use constant {
     RECONNECT_EVERY	=>	 100_000,	# Reconnect every 100 ms
     DFLT_ENCODER_TAG	=> 	'CB',		# Ecnode complex structures to CBOR by default
     DFLT_REDIS_DB_N	=>	 0,
+    FALSE		=>	undef,
+    TRUE		=>	1,
 };
 
 use strict;
@@ -151,8 +153,6 @@ EOMETHOD
     }
 
 }
-# By default, after connection failure try to reconnect every 100 ms up to 10 seconds
-my $redTestObj = Redis::Fast->new( 'reconnect' => RECONNECT_UP_TO, 'every' => RECONNECT_EVERY);
 sub new {
     state $exclOptions = +{ map {$_=>1} qw(on_connect redc index name client_name encoder) };
     my ($class, %options) = @_;
@@ -162,11 +162,11 @@ sub new {
     $coName //= join('_' => 'redc', 'anon', 'pid'.$$, int(rand 65536));
     exists($conoByName{$coName}) and confess sprintf(q<Cant initialize RedC: name '%s' was already reserved as a Redis connector name>, $coName);
     
-    if ( $conIndex ) {
-        my $nDB = databases( $redTestObj );
-        confess sprintf('Redis database index #%s is out of configured bounds (min=0, max=%d)',$conIndex, $nDB - 1)
-            if $conIndex >= $nDB;
-    }
+#    if ( $conIndex ) {
+#        my $nDB = databases( $redTestObj );
+#        confess sprintf('Redis database index #%s is out of configured bounds (min=0, max=%d)',$conIndex, $nDB - 1)
+#            if $conIndex >= $nDB;
+#    }
     my $redC;
     @options{ qw/name index redc/ } = ( $coName, $conIndex, \$redC );
     ($options{'client_name'} //= $coName . '__' . $$) =~ s%\s%_%g;
@@ -178,6 +178,7 @@ sub new {
             : ($_ = DFLT_ENCODER_TAG)
     }
     my $opts = \%options;
+    $opts->{'index_checked'} = FALSE;
     $redC = $class->SUPER::new(
 # Hint: you can redefine "reconnection" settings in your %options passed to constructor
         'reconnect'	=>	RECONNECT_UP_TO,
@@ -185,11 +186,20 @@ sub new {
         'on_connect'	=>	sub {
             my $self = $_[0];
             __call_this_if_coderef( $opts->{'on_connect'}, $self );
-            $self->SUPER::select( $opts->{'index'} );
+            $self->select($opts->{'index'}) if $opts->{'index_checked'};
             $self->SUPER::client_setname( $opts->{'client_name'} //= ($opts->{'name'} . '__' . $$) =~ s%\s%_%gr );
         },
         (map { $_ => $options{$_} } grep { !$exclOptions->{$_} } keys %options),
     );
+    
+    if ( defined(my $nDbSlotsNum = $redC->databases) ) {
+        $conIndex < $nDbSlotsNum 
+            or confess sprintf 'Cant use database #%d: maximum available database number is %d', $opts->{'index'}, $nDbSlotsNum;
+    }
+    
+    eval { $redC->select( $conIndex ) }
+        or confess "Cant select database number $conIndex. Redis says: $@";
+    $opts->{'index_checked'} = TRUE;
     $conoByRef{refaddr $redC} = $conoByName{$coName} = $opts;
     return $redC
 }
@@ -215,9 +225,7 @@ sub index {
 sub name { $conoByRef{refaddr $_[0]}{'name'} } 
 
 sub databases {
-    my $redC = shift;
-    open my $fh, '<', $redC->info->{'config_file'};
-    return ((local $/=<$fh>)=~m/(?:^|\n)\s*databases\s+(\d+)\s*(?:$|\n)/sm)[0];
+    $_[0]->config_get('databases')->[1]
 }
 
 sub get_redc_by {
