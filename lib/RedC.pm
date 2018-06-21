@@ -1,5 +1,7 @@
 #!/usr/bin/perl
 package RedC;
+our $VERSION = '0.71';
+
 use constant {
     RECONNECT_UP_TO	=>	 10,		# Reconnect up to 10 seconds
     RECONNECT_EVERY	=>	 100_000,	# Reconnect every 100 ms
@@ -14,7 +16,8 @@ use parent 'Redis::Fast';
 use utf8;
 binmode $_=>':utf8' for *STDOUT,*STDERR;
 use 5.16.1;
-use Data::Dumper;
+use Scalar::Util qw(looks_like_number);
+#use Data::Dumper;
 use Tag::DeCoder;
 use Carp		qw(confess);
 use Ref::Util 		qw(is_hashref is_plain_coderef is_plain_hashref is_plain_arrayref);
@@ -24,12 +27,7 @@ our @EXPORT_OK = qw(get_redc_by);
 
 my (%conoByName, %conoByRef);
 
-sub dump_cono_by {
-    say Dumper +{
-        'by_name' => \%conoByName,
-        'by_ref'  => \%conoByRef,
-    }
-}
+
 BEGIN {
     my %methodsGen = (
         'write' => {
@@ -153,6 +151,7 @@ EOMETHOD
     }
 
 }
+
 sub new {
     state $exclOptions = +{ map {$_=>1} qw(on_connect redc index name client_name encoder) };
     my ($class, %options) = @_;
@@ -162,11 +161,6 @@ sub new {
     $coName //= join('_' => 'redc', 'anon', 'pid'.$$, int(rand 65536));
     exists($conoByName{$coName}) and confess sprintf(q<Cant initialize RedC: name '%s' was already reserved as a Redis connector name>, $coName);
     
-#    if ( $conIndex ) {
-#        my $nDB = databases( $redTestObj );
-#        confess sprintf('Redis database index #%s is out of configured bounds (min=0, max=%d)',$conIndex, $nDB - 1)
-#            if $conIndex >= $nDB;
-#    }
     my $redC;
     @options{ qw/name index redc/ } = ( $coName, $conIndex, \$redC );
     ($options{'client_name'} //= $coName . '__' . $$) =~ s%\s%_%g;
@@ -186,20 +180,15 @@ sub new {
         'on_connect'	=>	sub {
             my $self = $_[0];
             __call_this_if_coderef( $opts->{'on_connect'}, $self );
-            $self->select($opts->{'index'}) if $opts->{'index_checked'};
+            $self->SUPER::select($opts->{'index'}) if $opts->{'index_checked'};
             $self->SUPER::client_setname( $opts->{'client_name'} //= ($opts->{'name'} . '__' . $$) =~ s%\s%_%gr );
         },
         (map { $_ => $options{$_} } grep { !$exclOptions->{$_} } keys %options),
     );
     
-    if ( defined(my $nDbSlotsNum = $redC->databases) ) {
-        $conIndex < $nDbSlotsNum 
-            or confess sprintf 'Cant use database #%d: maximum available database number is %d', $opts->{'index'}, $nDbSlotsNum;
-    }
-    
-    eval { $redC->select( $conIndex ) }
-        or confess "Cant select database number $conIndex. Redis says: $@";
+    $redC->select( $conIndex );
     $opts->{'index_checked'} = TRUE;
+    
     $conoByRef{refaddr $redC} = $conoByName{$coName} = $opts;
     return $redC
 }
@@ -208,13 +197,28 @@ sub encoder {
     $_[1] ? $conoByRef{refaddr $_[0]}{'encoder'} = $_[1] : $conoByRef{refaddr $_[0]}{'encoder'} //= DFLT_ENCODER_TAG
 }
 
+sub __set_db_num {
+    my ($self, $dbn)  = @_;
+    return (undef, 'Database index must be natural number') unless defined($dbn) and looks_like_number($dbn) and int(abs $dbn) == $dbn;
+    my $p_ind = \$conoByRef{refaddr $self}{'index'};
+    return ($dbn, undef) if ${$p_ind} == $dbn;
+    if ( defined(my $nDbSlotsNum = $self->databases) ) {
+        $dbn < $nDbSlotsNum
+            or return (undef, sprintf('Cant use database #%d: maximum available database number is %d', $dbn, $nDbSlotsNum))
+    }
+    eval { $self->SUPER::select( $dbn ) }
+        or return (undef, sprintf('Cant select database #%d: %s', $dbn, $@));
+    return (${$p_ind} = $dbn, undef)
+}
+
+# select is a simple frontend for __set_db_num. 
+# The difference between __set_db_num and select is:
+# 	select() raises exception on error, but __set_db_num returns error_message (if any) in a 2-nd element of the returned list
+#	select() returns instance object itself to make it possible to do "short" calls like this: $redC->select(4)->get($key)
 sub select {
     my ($self, $redisDbN) = @_;
-    my $p_ind = \$conoByRef{refaddr $self}{'index'};
-    return $self if ${$p_ind} == $redisDbN;
-    # Exception will be raised by the parent Redis::Fast class if something goes wrong, so we dont need to take care about select() result validation
-    $self->SUPER::select( $redisDbN );
-    ${$p_ind} = $redisDbN;
+    my ($rslt, $err) = &__set_db_num;
+    defined($err) and confess $err;
     return $self
 }
 
@@ -222,10 +226,12 @@ sub index {
     defined($_[1]) ? $_[0]->select($_[1]) : $conoByRef{refaddr $_[0]}{'index'}
 }
 
+# As for now changing of the database "name" on the fly is N.I.Y.
 sub name { $conoByRef{refaddr $_[0]}{'name'} } 
 
+# Hint: databases config_get('databases')->[1] will lead to exception in multi() mode because config_get('databases') will return "QUEUED" string instead of two values: "databases" and '$nDbSlotsNum"
 sub databases {
-    $_[0]->config_get('databases')->[1]
+    eval { $_[0]->config_get('databases')->[1] };
 }
 
 sub get_redc_by {
@@ -245,6 +251,13 @@ sub get_redc_by {
 sub __call_this_if_coderef {
     defined($_[0]) and is_plain_coderef($_[0]) and $_[0]->( $#_ > 0 ? @_[1..$#_] : () )
 }
+
+#sub __dump_cono_by {
+#    say Dumper +{
+#        'by_name' => \%conoByName,
+#        'by_ref'  => \%conoByRef,
+#    }
+#}
 
 sub DESTROY {
     delete $conoByName{ delete($conoByRef{refaddr $_[0]})->{'name'} };
